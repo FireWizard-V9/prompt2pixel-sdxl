@@ -1,0 +1,9 @@
+prompt enhancer should expand user requests into structured, descriptive tags covering four core layers:
+
+    Subject Details: Features, expression, armor/clothing, stance.
+
+    Environment & Background: Architecture, weather, time of day, depth of field.
+
+    Lighting & Atmosphere: Color palette, light sources (golden hour, rim lighting, volumetric fog).
+
+    Art Direction & Rendering Tokens: Photography/art style, camera lens focal length, rendering engine tokens.

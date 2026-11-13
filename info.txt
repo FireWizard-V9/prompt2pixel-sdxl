@@ -1,0 +1,330 @@
+Test 1: Single Image (POST /generate/single)
+
+Generates exactly 1 image for a single prompt.
+Bash
+
+curl -X POST "http://34.228.54.6:8000/generate/single" \
+     -H "Content-Type: application/json" \
+     -d '{
+           "prompt": "Chhatrapati Shivaji Maharaj in royal armor standing on Raigad Fort, majestic cinematic sunset, 8k photorealistic",
+           "steps": 4
+         }'
+
+Test 2: Batch Variations (POST /generate/batch)
+
+Generates 6 distinct variations for 1 prompt by incrementing the CUDA seed for each image.
+Bash
+
+curl -X POST "http://34.228.54.6:8000/generate/batch" \
+     -H "Content-Type: application/json" \
+     -d '{
+           "prompt": "Chhatrapati Shivaji Maharaj in royal armor standing on Raigad Fort, majestic cinematic sunset, 8k photorealistic",
+           "num_images": 6,
+           "steps": 4
+         }'
+
+Test 3: Multi-Prompt / Multi-Style (POST /generate/multi-prompt)
+
+Generates 1 image per prompt across 5 distinct artistic styles.
+Bash
+
+curl -X POST "http://34.228.54.6:8000/generate/multi-prompt" \
+     -H "Content-Type: application/json" \
+     -d '{
+           "prompts": [
+             "Chhatrapati Shivaji Maharaj on horseback, realistic oil painting style",
+             "Chhatrapati Shivaji Maharaj portrait, anime style, dramatic lighting",
+             "Chhatrapati Shivaji Maharaj, 3D Pixar animated character style",
+             "Chhatrapati Shivaji Maharaj, traditional Indian watercolor painting style",
+             "Chhatrapati Shivaji Maharaj in futuristic neon cyberpunk armor, 8k octane render"
+           ],
+           "steps": 4
+         }'
+         
+         
+         
+         
+         
+         
+         
+         
+         
+
+
+## 1. Project Codebase & Configuration Files
+
+All codebase files reside in `~/sdxl-tensorrt-service` on the EC2 host and are built directly into your Docker image (`sdxl-s3-service:v1`).
+
+```
+~/sdxl-tensorrt-service/
+├── Dockerfile
+├── requirements.txt
+├── download_weights.py
+├── server.py
+└── .env
+
+```
+
+| File Name | Primary Role & Responsibilities | Key Internal Logic |
+| --- | --- | --- |
+| **`Dockerfile`** | Container specification and environment setup. | Builds on `nvcr.io/nvidia/pytorch:23.10-py3`, installs system dependencies, copies application files, and exposes port `8000`. Sets Uvicorn entrypoint. |
+| **`requirements.txt`** | Python dependency pinning to eliminate version conflicts. | Pins `huggingface-hub<0.25.0`, `numpy<2.0.0`, `diffusers==0.26.3`, `torch`, `fastapi`, `uvicorn`, `boto3`, `safetensors`, and `python-dotenv`. |
+| **`download_weights.py`** | Offline pre-fetching script for host NVMe storage. | Downloads base SDXL 1.0, FP16 VAE fix, and SDXL-Lightning 4-step LoRA weights into `/mnt/fast-scratch/sdxl-data/hf_cache` to eliminate runtime download delays on cold boots. |
+| **`server.py`** | FastAPI application engine & inference orchestration. | Loads pipeline components into VRAM, fuses LoRA weights, compiles UNet with PyTorch 2.x SDPA, exposes 3 POST endpoints, streams PNG buffers to S3, and returns presigned URLs. |
+| **`.env`** | Secure credential management. | Stores AWS IAM keys (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_KEY`) and optional Hugging Face API tokens (`HF_TOKEN`) mapped into the container environment. |
+
+---
+
+## 2. API Endpoints (`server.py`)
+
+Your service exposes 3 dedicated HTTP POST endpoints for distinct image generation patterns:
+
+1. **`POST /generate/single`** (1 Prompt $\rightarrow$ 1 Image)
+* Accepts a single prompt and optional `steps` / `seed`.
+* Generates a single output artifact and returns its S3 presigned URL.
+
+
+2. **`POST /generate/batch`** (1 Prompt $\rightarrow$ N Seed Variations)
+* Accepts a single prompt and `num_images` (e.g., 6).
+* Generates $N$ distinct variations by assigning incremental CUDA seeds (`seed_base + i`) per iteration.
+
+
+3. **`POST /generate/multi-prompt`** (N Prompts $\rightarrow$ N Unique Images/Styles)
+* Accepts a list of distinct prompts (`prompts: [...]`).
+* Renders 1 image per prompt style using an independent random CUDA seed for each item in the list.
+
+
+
+---
+
+## 3. Model Specifications & AI Architecture
+
+Your pipeline combines three distinct machine learning models into a unified inference graph:
+
+```
+                  ┌──────────────────────────────────────────┐
+                  │   Base SDXL 1.0 (FP16 UNet + Text Enc)   │
+                  └────────────────────┬─────────────────────┘
+                                       │
+                         [pipe.load_lora_weights()]
+                                       ▼
+                  ┌──────────────────────────────────────────┐
+                  │ SDXL-Lightning 4-Step Distillation LoRA  │
+                  └────────────────────┬─────────────────────┘
+                                       │
+                                [pipe.fuse_lora()]
+                                       ▼
+ ┌────────────────────────┐    ┌─────────────────────────────┐
+ │ FP16 VAE Fix           ├───►│ Fused Execution Graph       │
+ │ (madebyollin)          │    │ (Euler Discrete Scheduler)  │
+ └────────────────────────┘    └─────────────────────────────┘
+
+```
+
+### Component Breakdown
+
+* **Base Pipeline Model:** `stabilityai/stable-diffusion-xl-base-1.0`
+* **Dual Text Encoders:** Combines CLIP ViT-L and OpenCLIP ViT-bigG to interpret complex prompts and style cues.
+* **Native Resolution:** Trained for $1024 \times 1024$ pixel output.
+* **Precision:** FP16 (`torch.float16`) to reduce memory footprint by ~50% compared to FP32.
+
+
+* **Distillation Acceleration:** `ByteDance/SDXL-Lightning` (`sdxl_lightning_4step_lora.safetensors`)
+* **Progressive Adversarial Diffusion Distillation (ADD):** Reduces standard SDXL sampling from 20–50 steps down to **4 steps** without losing photorealistic details.
+* **Fused LoRA Weight Injection:** Fused directly into the UNet tensor weights via `pipe.fuse_lora()`, eliminating LoRA adapter overhead during forward passes.
+
+
+* **Fixing Black Image Bug:** `madebyollin/sdxl-vae-fp16-fix`
+* Standard SDXL VAE causes numerical overflow under native FP16 on NVIDIA Turing architecture (T4 GPU), resulting in black or corrupted images.
+* This custom VAE patch preserves FP16 precision across latent decoding while preventing numerical overflow.
+
+
+* **Sampler / Scheduler:** `EulerDiscreteScheduler`
+* Configured with `timestep_spacing="trailing"` to match the exact noise schedule required by SDXL-Lightning step trajectories.
+
+
+
+---
+
+## 4. Hardware & Optimization Stack
+
+* **GPU Hardware:** NVIDIA Tesla T4 (16 GB VRAM, GDDR6, Turing Architecture).
+* **Host Storage:** Ephemeral NVMe scratch disk mounted at `/mnt/fast-scratch` mapped to container `/data`.
+* **PyTorch 2.x SDPA:** Native Scaled Dot-Product Attention eliminates the need for `xformers` while reducing attention memory overhead.
+* **`torch.compile(mode="reduce-overhead")`:** Fuses PyTorch execution operators into optimized C++ / CUDA kernels. Cuts inference latency down to ~2 seconds per image after initial warmup.
+* **Memory Slicing:** `enable_attention_slicing()` and `enable_vae_slicing()` prevent VRAM out-of-memory errors when processing multi-image batches.
+* **In-Memory Streaming:** Images pass directly from GPU tensor output to standard PNG format inside a PyTorch `io.BytesIO` memory buffer. Bypasses host disk I/O and streams directly to AWS S3 (`viv-image-gen-presentation`).
+
+---
+
+## 5. End-to-End System Architecture
+
+```
+                                 [ HTTP Client / User ]
+                                           │
+                                 POST /generate/batch
+                                           │
+                                           ▼
+                            ┌──────────────────────────────┐
+                            │  AWS EC2 Host (g4dn.xlarge)  │
+                            │  Public IP: 34.228.54.6      │
+                            └──────────────┬───────────────┘
+                                           │ (Port 8000)
+                                           ▼
+                            ┌──────────────────────────────┐
+                            │   Docker Container           │
+                            │   (sdxl_service)             │
+                            │   Restart Policy: always     │
+                            └──────────────┬───────────────┘
+                                           │
+                                           ▼
+┌─────────────────────────┐    ┌───────────────────────────┐    ┌─────────────────────────┐
+│ Persistent Host Volume  │    │  Inference Engine         │    │ AWS S3 Bucket           │
+│ /mnt/fast-scratch/      ├───►│  NVIDIA T4 (16GB VRAM)    ├───►│ viv-image-gen-          │
+│ sdxl-data/hf_cache      │    │  PyTorch 2.x + Compiled   │    │ presentation            │
+└─────────────────────────┘    │  SDXL-Lightning 4-step    │    └────────────┬────────────┘
+                               └───────────────────────────┘                 │
+                                                                             ▼
+                                                                  [ 1-Hour Presigned URLs ]
+
+```
+
+
+
+
+
+
+Strict Instructions & User Override Handling
+
+To ensure the Agent balances quality enhancements while respecting user constraints, we embed explicit Rule Priorities within the system prompt:
+
+    User Override Rule: If the user specifies an explicit style, background, aspect ratio, camera angle, or subject restriction (e.g., "Make it line art, NO background"), the agent must strictly follow the user's explicit choices and not force photorealism or extra background elements.
+
+    Context Enrichment Rule: If the user provides a vague or standard concept, the agent uses its CBSE curriculum background knowledge to build rich visual details.
+
+
+    Prompt Enhancer Agent microservice designed to handle any subject domain (STEM, Humanities, Arts, Languages, everyday concepts) and transform raw user queries into rich, multi-layered SDXL prompts.
+
+
+
+
+
+
+
+
+    [ Client ]
+     │
+     │ 1. POST /agent/process (Raw Prompt)
+     ▼
+ ┌─────────────────────────────────────────────────────────┐
+ │ Prompt Enhancer Agent Microservice (Port 8001)          │
+ │                                                         │
+ │ - Generates Trace ID: YYYYMMDD-HHMMSS-<short_uuid>      │
+ │ - Invokes OpenRouter (openai/gpt-4o-mini via LangChain) │
+ │ - Returns structured 4-layer SDXL prompt                │
+ └────────────────────────────┬────────────────────────────┘
+                              │
+                              │ 2. POST /generate/single
+                              │    Header: X-Request-ID: 20261108-230542-f4c80777
+                              ▼
+ ┌─────────────────────────────────────────────────────────┐
+ │ SDXL GPU Inference Microservice (Port 8000)             │
+ │                                                         │
+ │ - Executes 4-step UNet forward pass on NVIDIA T4 GPU    │
+ │ - Encodes PNG in memory buffer (io.BytesIO)             │
+ │ - Uploads directly to AWS S3 bucket                     │
+ │ - Generates 1-hour presigned GET URL                    │
+ └────────────────────────────┬────────────────────────────┘
+                              │
+                              │ 3. Returns GPU Response Payload
+                              ▼
+ [ Client ] ◄─────────────────┘ (Receives trace_id + S3 Presigned URL)
+
+
+
+
+
+
+
+ [ Client / Frontend ]
+         │
+         │ 1. Simple User Query (REST API over Port 8001)
+         ▼
+┌────────────────────────────────────────────────────────┐
+│  Tier 1: Prompt Enhancer Agent Microservice            │
+│  - LangChain + OpenRouter (GPT-4o-Mini)                │
+│  - Converts simple queries into SDXL visual prompts     │
+│  - Enforces strict CLIP token length limits (≤60 words) │
+│  - Maintains end-to-end distributed Request-ID tracing  │
+└───────────────────────────┬────────────────────────────┘
+                            │
+                            │ 2. Enhanced Prompt + X-Request-ID (Port 8000)
+                            ▼
+┌────────────────────────────────────────────────────────┐
+│  Tier 2: SDXL GPU Inference Engine                     │
+│  - Base SDXL 1.0 + 4-Step SDXL-Lightning LoRA          │
+│  - PyTorch 2.x SDPA + torch.compile graph optimization │
+│  - In-Memory PNG streaming (Zero disk I/O latency)     │
+└───────────────────────────┬────────────────────────────┘
+                            │
+                            │ 3. Direct Streaming Upload
+                            ▼
+┌────────────────────────────────────────────────────────┐
+│  AWS S3 Bucket (viv-image-gen-presentation)            │
+│  - Stores at: requests/{YYYYMMDD-HHMMSS-uuid}/image.png│
+│  - Returns secure 1-Hour Presigned URLs to Client      │
+
+
+
+
+
+Mode 1: Single Image (mode: "single")Takes a simple user topic, expands it into one detailed prompt, and renders 1 high-resolution image.JSON{
+  "prompt": "Electrolysis of water experiment setup",
+  "mode": "single",
+  "steps": 4
+}
+Mode 2: Batch Variations (mode: "batch")Takes 1 concept, enhances it into a master prompt, and generates $N$ distinct visual variations using sequential random seeds.JSON{
+  "prompt": "Human heart anatomical diagram, minimalist line art, plain white background",
+  "mode": "batch",
+  "num_images": 3,
+  "steps": 4
+}
+Mode 3: Multi-Prompt Exploration (mode: "multi-prompt")Asks the agent to construct $N$ unique conceptual perspectives/prompts for the same subject, returning 1 rendered image per perspective.JSON{
+  "prompt": "Emperor Ashoka after Kalinga war",
+  "mode": "multi-prompt",
+  "num_images": 3,
+  "steps": 4
+}
+
+
+
+
+
+
+
+Standard API Response Payload
+
+Regardless of mode, the API returns a clean, self-contained JSON response containing the trace ID, original prompt, LLM-enhanced prompt(s), and S3 presigned URL(s):
+JSON
+
+{
+  "request_id": "20261109-045412-a1b2c3d4",
+  "original_prompt": "Electrolysis of water experiment setup",
+  "mode": "single",
+  "enhanced_prompts_used": [
+    "Scientific laboratory photo of a glass Hoffmann voltameter filled with acidified water. Platinum electrodes producing oxygen and hydrogen bubbles at anode and cathode. Clear volumetric marks, lab bench background, soft ring-light illumination, crisp reflections, textbook 3D render quality."
+  ],
+  "gpu_service_response": {
+    "request_id": "20261109-045412-a1b2c3d4",
+    "count": 1,
+    "images": [
+      {
+        "request_id": "20261109-045412-a1b2c3d4",
+        "prompt": "Scientific laboratory photo of a glass Hoffmann voltameter...",
+        "s3_key": "requests/20261109-045412-a1b2c3d4/image_1.png",
+        "seed_used": 3923427293,
+        "url": "https://viv-image-gen-presentation.s3.amazonaws.com/requests/20261109-045412-a1b2c3d4/image_1.png?AWSAccessKeyId=AKIA...&Signature=...&Expires=1794182748"
+      }
+    ]
+  }
+}
